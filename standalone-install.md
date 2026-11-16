@@ -2,16 +2,16 @@
 
 This guide installs SonarQube Server 2026.5 Enterprise Edition together with the Agent Orchestrator, the Hunter Agent, the Remediation Agent, Vortex analysis and the egress proxy on a single Linux host with Docker Compose. A generator script produces the Compose bundle, so no Compose file is written by hand.
 
-To connect the agents to a SonarQube Server that is already installed, use `--edition none` instead. That path is covered in [Deploying with Docker Compose](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/deploying-with-docker-compose).
+To connect the agents to a SonarQube Server installed from the ZIP file, the generator is run with `--edition none`; see [Deploying alongside a ZIP installation](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/deploying-alongside-zip-installation). The generator cannot attach the agents to a SonarQube Server that already runs in a container. The Docker path is described in [Deploying with a Docker installation](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/deploying-with-docker-compose).
 
 ## Requirements
 
 | Item | Requirement |
 |---|---|
 | Host | Linux, x86-64 or ARM64, kernel 4.14.77 or later. Docker Desktop on macOS or Windows is not supported |
-| Size | 8 vCPU, 32 GiB memory and 150 GB of disk hold SonarQube, PostgreSQL, the orchestrator, one Hunter runtime, one Remediation runtime, Vortex and the egress proxy. See [Capacity planning](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/capacity-planning) to size for concurrent jobs |
-| Software | Docker Engine with Docker Compose v2.23 or later, Python 3.9 or later, git, and root access on the host |
-| Network | Outbound access to Docker Hub, the gVisor download site, your LLM provider and GitHub (or your GitHub Enterprise instance) |
+| Size | 8 vCPU, 32 GiB memory and 150 GB of disk is the size this procedure was run on, with SonarQube, PostgreSQL, the orchestrator, one Hunter runtime, one Remediation runtime, Vortex and the egress proxy. It was not load-tested. See [Capacity planning](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/capacity-planning) to size for concurrent jobs |
+| Software | Docker Engine with Docker Compose v2.23 or later, Python 3.9 or later, git, openssl, and root access on the host |
+| Network | Outbound access to Docker Hub, the gVisor download site, the LLM provider and GitHub (or a GitHub Enterprise instance) |
 | License | An Enterprise Edition license, with Hunter Agent and Remediation Agent subscriptions added to it. See [Before you start](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/before-you-start) |
 | Other | A GitHub App for the repositories the agents will work on, and an API key for the LLM provider |
 
@@ -36,7 +36,7 @@ docker compose version
 docker run --rm hello-world
 ```
 
-For other distributions, follow the [Docker Engine installation guide](https://docs.docker.com/engine/install/).
+These commands use Docker's CentOS repository, which installed without conflicts on RHEL 9.8. Docker documents a separate RHEL repository (`https://download.docker.com/linux/rhel/docker-ce.repo`) and the removal of conflicting packages such as `podman` and `runc` in its [RHEL installation guide](https://docs.docker.com/engine/install/rhel/). Membership of the `docker` group gives root-equivalent access to the host, so only administrators belong in it. For other distributions, follow the [Docker Engine installation guide](https://docs.docker.com/engine/install/).
 
 ## 2. Install and register the gVisor sandbox
 
@@ -49,6 +49,7 @@ curl -fsSL -o runsc $URL/runsc
 curl -fsSL -o runsc.sha512 $URL/runsc.sha512
 sha512sum -c runsc.sha512
 chmod a+rx runsc && sudo mv runsc /usr/local/bin/
+rm runsc.sha512
 ```
 
 Register `runsc` as a Docker runtime in `/etc/docker/daemon.json`. If the file already exists, add the `runtimes` entry to it instead of replacing the file.
@@ -66,14 +67,14 @@ Register `runsc` as a Docker runtime in `/etc/docker/daemon.json`. If the file a
 
 `--network=host` lets containers on a user-defined network resolve each other's names under gVisor. `--overlay2=root:self,size=50g` caps the writable layer of each job container.
 
-Restart Docker and confirm a container starts under gVisor. The first line of the output is `Starting gVisor...`.
+Restart Docker and confirm a container starts under gVisor. The output includes `Starting gVisor...`. Restarting Docker stops running containers unless `live-restore` is enabled, so this step belongs before the bundle is started.
 
 ```
 sudo systemctl restart docker
 docker run --runtime=runsc --rm alpine dmesg
 ```
 
-If the container fails with an SELinux denial, see the gVisor documentation for the SELinux options that apply to your distribution.
+With SELinux in enforcing mode on RHEL 9.8, the container started without a denial. If a container fails with an SELinux denial on another distribution, see [Setting up the sandbox runtime](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/sandbox-runtime) and the gVisor documentation.
 
 ## 3. Set the kernel parameter for Elasticsearch
 
@@ -91,7 +92,7 @@ sudo sysctl --system
 sysctl vm.max_map_count
 ```
 
-The output of the last command is `vm.max_map_count = 262144`. The file name starts with `zz-` because the files in `/etc/sysctl.d/` are applied in alphabetical order and the last file wins, so a distribution file with a later name cannot override it.
+The output of the last command is `vm.max_map_count = 262144`. The file name starts with `zz-` because the files in `/etc/sysctl.d/` are applied in alphabetical order and the last file wins. If the last command reports a different value, another configuration file, such as `/etc/sysctl.conf`, sets the parameter and needs the same value.
 
 ## 4. Get the generator
 
@@ -121,6 +122,8 @@ python3 generate.py --edition enterprise \
   --out ~/bundle
 ```
 
+Without `--tls-server-name`, the certificate and SonarQube's server base URL use `localhost`, and access is through an SSH tunnel (step 7). To reach the host by a name, add `--tls-server-name <host name>` to the command.
+
 | Option | Meaning |
 |---|---|
 | `--edition enterprise` | Runs SonarQube Server Enterprise Edition and a bundled PostgreSQL inside the bundle |
@@ -138,17 +141,19 @@ The bundle contains the secret that signs requests between SonarQube, the orches
 
 ## 6. Start the bundle
 
+The bundle publishes port 9443 on every network interface of the host, and the default administrator account is reachable on that port until its password is changed (step 7). Restrict inbound access to 9443 with a firewall or security group before starting the bundle.
+
 ```
 cd ~/bundle
 docker compose up -d
 docker compose ps
 ```
 
-The first start takes several minutes. The init services, such as `storage-init` and `truststore-init`, never report healthy: they prepare a volume and exit with code 0. `docker compose ps -a` lists them as exited.
+The first start takes several minutes. The init services, `storage-init` and `signing-init`, never report healthy: they prepare a volume and exit with code 0. `docker compose ps -a` lists them as exited.
 
 ## 7. Open SonarQube
 
-Browse to `https://<host name>:9443`. The certificate is self-signed, so the browser shows a warning until a certificate of your own is installed. The bundle README describes how to serve your own certificate.
+Browse to `https://<host name>:9443`, where the host name is the `--tls-server-name` value, or to `https://localhost:9443` through the SSH tunnel below when the default was used. The certificate is self-signed, so the browser shows a warning until another certificate is installed. The bundle README describes how to serve another certificate.
 
 To reach a host that does not accept direct connections, forward the port over SSH and browse to `https://localhost:9443`:
 
@@ -158,23 +163,23 @@ ssh -N -L 9443:localhost:9443 <user>@<host>
 
 The command stays in the foreground while the tunnel is open.
 
-Sign in with the default administrator account and change the password when prompted.
+Sign in with `admin` and `admin`. SonarQube asks for a new password.
 
 ## 8. Configure SonarQube
 
 1. Apply the license under **Administration** > **Configuration** > **License Manager**. The license must include the Hunter Agent and Remediation Agent subscriptions.
-2. Confirm that the settings encryption key is in place before registering the LLM provider, so that the provider's API key is stored encrypted. Open **Administration** > **Configuration** > **Encryption**. The page reads "Secret key is registered", because the bundle mounted the key file from step 5. Do not select **Generate New Secret Key**: it replaces the key, and the orchestrator keeps decrypting with the old one. See [Sensitive settings](https://docs.sonarsource.com/sonarqube-server/instance-administration/security/encrypting-settings).
+2. Confirm that the settings encryption key is in place before registering the LLM provider, so that the provider's API key is stored encrypted. Open **Administration** > **Configuration** > **Encryption**. The page reads "Secret key is registered", because the bundle mounted the key file from step 5. Do not generate a new secret key on this page: it replaces the key, and the orchestrator keeps decrypting with the old one. See [Sensitive settings](https://docs.sonarsource.com/sonarqube-server/instance-administration/security/encrypting-settings).
 3. Register the LLM provider and select a model under **Administration** > **Configuration** > **AI Capabilities** > **LLM Providers**. The agent toggles stay locked until a provider and a model are saved.
-4. Connect the repositories through a GitHub App, bind each project to its repository, and run an analysis so that the agents have issues to work from.
-5. Turn on the Hunter Agent and the Remediation Agent for the projects.
+4. Create a GitHub App integration under **Administration** > **Configuration** > **DevOps Platform Integrations**, bind each project to its repository, and run an analysis so that the agents have issues to work from.
+5. Turn on the Hunter Agent and the Remediation Agent under **Administration** > **Configuration** > **AI Capabilities**.
 
 ## 9. Check that the agents are connected
 
-Open **Administration** > **System**. The Agent Orchestrator, Vortex analysis and each agent runtime should report healthy. See [Verifying the deployment](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/verifying-the-deployment).
+Open **Administration** > **System**. The Agent Orchestrator, Vortex analysis and each agent runtime report healthy. See [Verifying the deployment](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/verifying-the-deployment).
 
 ## Upgrading
 
-Regenerate the bundle into the same directory with the same options and the new `--sonarqube-tag`, then run `docker compose up -d`. The generator keeps the signing secret and stops before overwriting a file that was edited. Local changes belong in `docker-compose.override.yaml`, which the generator never writes. Do not run `docker compose down -v`: it deletes the named volumes, including the database.
+Regenerate the bundle into the same directory with the same options and the new `--sonarqube-tag`, then run `docker compose up -d`. The generator keeps the signing secret and stops before overwriting a file that was edited. After an update that changes the database schema, SonarQube Server does not migrate the database by itself and stays unhealthy until the migration is started: open `/setup` in SonarQube Server, or send `POST /api/system/migrate_db`. The orchestrator starts after the migration. Patch updates within one release line do not normally change the schema. The generator sets `stop_grace_period` on each service so that a stop waits for running jobs to drain, up to 44,430 seconds for the Hunter Agent runtime. Removing it makes a stop kill running jobs after 10 seconds and loses their results; see [Deploying with a Docker installation](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/deploying-with-docker-compose). Local changes belong in `docker-compose.override.yaml`, which the generator never writes. Do not run `docker compose down -v`: it deletes the named volumes, including the database.
 
 ## Troubleshooting
 
