@@ -92,4 +92,8 @@ The troubleshooting table in [standalone-install.md](standalone-install.md#troub
 - [Verifying the deployment](https://docs.sonarsource.com/sonarqube-server/server-installation/ai-agents/verifying-the-deployment)
 - [Sensitive settings](https://docs.sonarsource.com/sonarqube-server/instance-administration/security/encrypting-settings)
 
-Content verified against the public documentation and the generator on 2026-11-16.
+## Verification
+
+Steps 1 to 7 and the service checks in step 9 were run on RHEL 9.8 (x86-64, 8 vCPU, 32 GiB, SELinux enforcing) on 2026-11-16 with SonarQube Server 2026.5.4 Enterprise Edition, Docker Compose v5.7.1 and gVisor release 20260706. All services reported healthy, both agent runtimes ran under `runsc`, the settings encryption key was registered, and the orchestrator reported the Hunter Agent and Remediation Agent healthy. The `unknown or invalid runtime name: runsc` and `refers to undefined volume` troubleshooting entries were reproduced.
+
+The license, LLM provider, GitHub App and agent activation parts of step 8 were not run. The links were checked against the public documentation and the generator on the same date.
